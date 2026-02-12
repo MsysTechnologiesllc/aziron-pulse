@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  aziron-pulse:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aziron-pulse
+    ports:
+      - "8081:8081"
+    environment:
+      - PULSE_PORT=8081
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-tempo:4318}
+      - OTEL_SERVICE_NAME=aziron-pulse
+    networks:
+      - aziron-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8081/pulse/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  aziron-network:
+    external: true
