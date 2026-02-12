@@ -10,13 +10,28 @@ services:
       - "8081:8081"
     environment:
       - PULSE_PORT=8081
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=password
+      - DB_NAME=aziron
+      - DB_SSLMODE=disable
+      - JWT_SECRET=your-secret-key
+      - AZIRON_WORKSPACE=/var/aziron/workspace
+      - BASE_IMAGE=codercom/code-server:latest
+      - TTL_CHECK_INTERVAL=5
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-tempo:4318}
       - OTEL_SERVICE_NAME=aziron-pulse
+    volumes:
+      - ./workspace:/var/aziron/workspace
+      - ~/.kube/config:/root/.kube/config:ro
+    depends_on:
+      - postgres
     networks:
       - aziron-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8081/pulse/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8081/health"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -27,6 +42,30 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  postgres:
+    image: postgres:15-alpine
+    container_name: aziron-pulse-postgres
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=aziron
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./db/schema:/docker-entrypoint-initdb.d
+    networks:
+      - aziron-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
 networks:
   aziron-network:
-    external: true
+    driver: bridge
+
+volumes:
+  postgres-data:

@@ -3,38 +3,36 @@ package telemetry
 import (
 	"context"
 	"fmt"
-	"os"
-	"time"
+	"log"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 )
 
-// InitTelemetry initializes OpenTelemetry tracing
-func InitTelemetry(ctx context.Context, serviceName, version string) (func(context.Context) error, error) {
-	// Get OTLP endpoint from environment
-	otlpEndpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-	if otlpEndpoint == "" {
-		otlpEndpoint = "localhost:4318" // Default for local development
-	}
+// Note: All Prometheus metrics are now in pulse_metrics.go
+// This file only handles OpenTelemetry tracing initialization
 
-	// Create OTLP trace exporter
+// InitTelemetry initializes OpenTelemetry tracing
+func InitTelemetry(serviceName, otelEndpoint string) (func(context.Context) error, error) {
+	ctx := context.Background()
+
+	// Create OTLP HTTP exporter
 	exporter, err := otlptracehttp.New(ctx,
-		otlptracehttp.WithEndpoint(otlpEndpoint),
-		otlptracehttp.WithInsecure(), // Use insecure for local development
+		otlptracehttp.WithEndpoint(otelEndpoint),
+		otlptracehttp.WithInsecure(),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create OTLP trace exporter: %w", err)
+		return nil, fmt.Errorf("failed to create OTLP exporter: %w", err)
 	}
 
-	// Create resource with service information
+	// Create resource
 	res, err := resource.New(ctx,
 		resource.WithAttributes(
-			semconv.ServiceNameKey.String(serviceName),
-			semconv.ServiceVersionKey.String(version),
+			semconv.ServiceName(serviceName),
 		),
 	)
 	if err != nil {
@@ -43,18 +41,18 @@ func InitTelemetry(ctx context.Context, serviceName, version string) (func(conte
 
 	// Create trace provider
 	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter,
-			sdktrace.WithBatchTimeout(5*time.Second),
-		),
+		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(res),
-		sdktrace.WithSampler(sdktrace.AlwaysSample()),
 	)
 
 	// Set global trace provider
 	otel.SetTracerProvider(tp)
 
+	// Set global propagator
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	log.Printf("OpenTelemetry initialized with endpoint: %s", otelEndpoint)
+
 	// Return shutdown function
-	return func(ctx context.Context) error {
-		return tp.Shutdown(ctx)
-	}, nil
+	return tp.Shutdown, nil
 }
