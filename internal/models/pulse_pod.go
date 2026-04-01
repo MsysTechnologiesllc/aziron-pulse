@@ -31,6 +31,8 @@ type PulsePod struct {
 	TraceID        *string    `json:"trace_id,omitempty" db:"trace_id"`
 	SpanID         *string    `json:"span_id,omitempty" db:"span_id"`
 	UserEmail      *string    `json:"user_email,omitempty" db:"user_email"`
+	RepoURL        *string    `json:"repo_url,omitempty" db:"repo_url"`
+	ResourceTier   string     `json:"resource_tier,omitempty" db:"resource_tier"`
 	Metadata       JSONBMap   `json:"metadata,omitempty" db:"metadata"`
 	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt      time.Time  `json:"updated_at" db:"updated_at"`

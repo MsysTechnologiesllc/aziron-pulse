@@ -31,16 +31,42 @@ type ProvisionService struct {
 	workspaceRoot string
 }
 
+// Resource tier presets
+const (
+	ResourceTierSmall  = "small"  // 1 CPU / 2048 MB
+	ResourceTierMedium = "medium" // 2 CPU / 4096 MB (default)
+	ResourceTierLarge  = "large"  // 4 CPU / 8192 MB
+)
+
 // ProvisionRequest holds pod provision request data
 type ProvisionRequest struct {
-	UserID    uuid.UUID
-	TenantID  *uuid.UUID
-	BaseImage string
-	CPULimit  float64
-	MemoryMB  int
-	StorageGB int
-	Metadata  models.JSONBMap
-	JWTToken  string // JWT token to use as code-server password
+	UserID            uuid.UUID
+	TenantID          *uuid.UUID
+	BaseImage         string
+	CPULimit          float64
+	MemoryMB          int
+	StorageGB         int
+	Metadata          models.JSONBMap
+	JWTToken          string // JWT token to use as code-server password
+	ResourceTier      string // "small"|"medium"|"large" — overrides CPULimit/MemoryMB when set
+	RepoURL           string // Git repository URL to clone into workspace on startup
+	GitToken          string // OAuth token for private repository access
+	FusionXBackendURL string // Aziron backend URL injected into FusionX extension config
+}
+
+// resolveTierResources maps a named tier to CPU and memory values.
+// Returns (cpu, memoryMB). If tier is unrecognised the request values are returned unchanged.
+func resolveTierResources(tier string, cpu float64, memMB int) (float64, int) {
+	switch tier {
+	case ResourceTierSmall:
+		return 1.0, 2048
+	case ResourceTierLarge:
+		return 4.0, 8192
+	case ResourceTierMedium:
+		return 2.0, 4096
+	default:
+		return cpu, memMB
+	}
 }
 
 // NewProvisionService creates a new provision service
@@ -69,7 +95,22 @@ func (s *ProvisionService) ProvisionPod(ctx context.Context, req ProvisionReques
 	s.logger.Info("Starting pod provision",
 		zap.String("user_id", req.UserID.String()),
 		zap.String("base_image", req.BaseImage),
+		zap.String("resource_tier", req.ResourceTier),
 	)
+
+	// Normalize FusionX backend URL: default to production Aziron Studio.
+	// The caller may omit the field or send the React dev-server address (localhost:3000);
+	// any empty or localhost value is replaced with the canonical production URL.
+	if req.FusionXBackendURL == "" ||
+		strings.HasPrefix(req.FusionXBackendURL, "http://localhost") ||
+		strings.HasPrefix(req.FusionXBackendURL, "http://127.0.0.1") {
+		req.FusionXBackendURL = "https://studio.aziro.com"
+	}
+
+	// Resolve resource tier to concrete CPU/memory values
+	if req.ResourceTier != "" {
+		req.CPULimit, req.MemoryMB = resolveTierResources(req.ResourceTier, req.CPULimit, req.MemoryMB)
+	}
 
 	// Check quota
 	quota, err := s.quotaRepo.GetOrCreateDefault(ctx, req.UserID)
@@ -133,15 +174,30 @@ func (s *ProvisionService) ProvisionPod(ctx context.Context, req ProvisionReques
 		return nil, fmt.Errorf("failed to create PVC: %w", err)
 	}
 
+	// Enrich metadata with repo and tier info for display in the UI
+	if req.Metadata == nil {
+		req.Metadata = models.JSONBMap{}
+	}
+	if req.RepoURL != "" {
+		req.Metadata["repo_url"] = req.RepoURL
+	}
+	if req.ResourceTier != "" {
+		req.Metadata["resource_tier"] = req.ResourceTier
+	}
+
 	// Create pod
 	_, err = s.podMgr.CreatePod(ctx, k8s.PodConfig{
-		Name:          podName,
-		Namespace:     namespace,
-		Image:         req.BaseImage,
-		PVCName:       pvcName,
-		WorkspacePath: workspacePath,
-		CPULimit:      req.CPULimit,
-		MemoryLimitMB: req.MemoryMB,
+		Name:              podName,
+		Namespace:         namespace,
+		Image:             req.BaseImage,
+		PVCName:           pvcName,
+		WorkspacePath:     workspacePath,
+		CPULimit:          req.CPULimit,
+		MemoryLimitMB:     req.MemoryMB,
+		FusionXBackendURL: req.FusionXBackendURL,
+		RepoURL:           req.RepoURL,
+		GitToken:          req.GitToken,
+		PulseID:           pulseID,
 		Env: map[string]string{
 			"JWT_TOKEN": req.JWTToken, // Pass JWT token for code-server password
 		},
@@ -300,4 +356,14 @@ func (s *ProvisionService) UpdatePodActivity(ctx context.Context, pulseID string
 	}
 
 	return s.podRepo.UpdateActivity(ctx, pod.ID)
+}
+
+// ListPodActivities returns recent activities for a pod (latest first)
+func (s *ProvisionService) ListPodActivities(ctx context.Context, pulseID string) ([]*models.PodActivity, error) {
+	pod, err := s.podRepo.GetByPulseID(ctx, pulseID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pod: %w", err)
+	}
+
+	return s.activityRepo.ListByPulseID(ctx, pod.ID, 50)
 }

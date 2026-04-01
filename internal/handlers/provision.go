@@ -27,11 +27,15 @@ func NewProvisionHandler(provisionSvc *service.ProvisionService, logger *zap.Log
 
 // ProvisionRequest represents the provision API request
 type ProvisionRequest struct {
-	BaseImage string                 `json:"base_image,omitempty"`
-	CPULimit  *float64               `json:"cpu_limit,omitempty"`
-	MemoryMB  *int                   `json:"memory_mb,omitempty"`
-	StorageGB *int                   `json:"storage_gb,omitempty"`
-	Metadata  map[string]interface{} `json:"metadata,omitempty"`
+	BaseImage        string                 `json:"base_image,omitempty"`
+	CPULimit         *float64               `json:"cpu_limit,omitempty"`
+	MemoryMB         *int                   `json:"memory_mb,omitempty"`
+	StorageGB        *int                   `json:"storage_gb,omitempty"`
+	Metadata         map[string]interface{} `json:"metadata,omitempty"`
+	ResourceTier     string                 `json:"resource_tier,omitempty"`     // "small"|"medium"|"large"
+	RepoURL          string                 `json:"repo_url,omitempty"`          // git repo to clone on startup
+	GitToken         string                 `json:"git_token,omitempty"`         // OAuth token (session only — not persisted)
+	FusionXBackendURL string                `json:"fusionx_backend_url,omitempty"` // Aziron backend URL for FusionX
 }
 
 // ProvisionPod handles POST /provision
@@ -63,7 +67,7 @@ func (h *ProvisionHandler) ProvisionPod(w http.ResponseWriter, r *http.Request) 
 
 	// Set defaults
 	if req.BaseImage == "" {
-		req.BaseImage = "codercom/code-server:latest"
+		req.BaseImage = "aziron/code-server-fusionx:latest"
 	}
 	if req.CPULimit == nil {
 		cpu := 2.0
@@ -80,14 +84,18 @@ func (h *ProvisionHandler) ProvisionPod(w http.ResponseWriter, r *http.Request) 
 
 	// Provision pod
 	pod, err := h.provisionSvc.ProvisionPod(ctx, service.ProvisionRequest{
-		UserID:    userID,
-		TenantID:  tenantID,
-		BaseImage: req.BaseImage,
-		CPULimit:  *req.CPULimit,
-		MemoryMB:  *req.MemoryMB,
-		StorageGB: *req.StorageGB,
-		Metadata:  models.JSONBMap(req.Metadata),
-		JWTToken:  jwtToken, // Pass JWT token for code-server password
+		UserID:           userID,
+		TenantID:         tenantID,
+		BaseImage:        req.BaseImage,
+		CPULimit:         *req.CPULimit,
+		MemoryMB:         *req.MemoryMB,
+		StorageGB:        *req.StorageGB,
+		Metadata:         models.JSONBMap(req.Metadata),
+		JWTToken:         jwtToken,
+		ResourceTier:     req.ResourceTier,
+		RepoURL:          req.RepoURL,
+		GitToken:         req.GitToken,
+		FusionXBackendURL: req.FusionXBackendURL,
 	})
 	if err != nil {
 		h.logger.Error("Failed to provision pod", zap.Error(err))
@@ -153,6 +161,43 @@ func (h *ProvisionHandler) ListPods(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"pods":  pods,
 		"count": len(pods),
+	})
+}
+
+// ListActivities handles GET /provision/{pulse_id}/activities
+func (h *ProvisionHandler) ListActivities(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	vars := mux.Vars(r)
+	pulseID := vars["pulse_id"]
+
+	userID, err := middleware.GetUserID(ctx)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Verify ownership before returning activities
+	pod, err := h.provisionSvc.GetPod(ctx, pulseID)
+	if err != nil {
+		http.Error(w, "Pod not found", http.StatusNotFound)
+		return
+	}
+	if pod.UserID != userID {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	activities, err := h.provisionSvc.ListPodActivities(ctx, pulseID)
+	if err != nil {
+		h.logger.Error("Failed to list activities", zap.Error(err))
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"activities": activities,
+		"count":      len(activities),
 	})
 }
 

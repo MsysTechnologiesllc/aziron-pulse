@@ -6,8 +6,10 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 
+	"github.com/MsysTechnologiesllc/aziron-pulse/internal/k8s"
 	"github.com/MsysTechnologiesllc/aziron-pulse/internal/middleware"
 	"github.com/MsysTechnologiesllc/aziron-pulse/internal/service"
 	"github.com/gorilla/mux"
@@ -16,15 +18,19 @@ import (
 
 // ProxyHandler handles proxying requests to code-server pods
 type ProxyHandler struct {
-	provisionSvc *service.ProvisionService
-	logger       *zap.Logger
+	provisionSvc   *service.ProvisionService
+	portForwardMgr *k8s.PortForwardManager // non-nil when K8S_NODE_IP is set (local dev)
+	logger         *zap.Logger
 }
 
-// NewProxyHandler creates a new proxy handler
-func NewProxyHandler(provisionSvc *service.ProvisionService, logger *zap.Logger) *ProxyHandler {
+// NewProxyHandler creates a new proxy handler.
+// portForwardMgr may be nil (production); when set it is used for local dev
+// environments where the cluster network is not directly reachable from the host.
+func NewProxyHandler(provisionSvc *service.ProvisionService, portForwardMgr *k8s.PortForwardManager, logger *zap.Logger) *ProxyHandler {
 	return &ProxyHandler{
-		provisionSvc: provisionSvc,
-		logger:       logger,
+		provisionSvc:   provisionSvc,
+		portForwardMgr: portForwardMgr,
+		logger:         logger,
 	}
 }
 
@@ -57,13 +63,22 @@ func (h *ProxyHandler) ProxyToPod(w http.ResponseWriter, r *http.Request) {
 	// Update activity timestamp
 	_ = h.provisionSvc.UpdatePodActivity(ctx, pulseID)
 
-	// Build target URL
+	// Build target URL.
+	// When K8S_NODE_IP is set (local dev / minikube) we use a kubectl-style
+	// port-forward through the Kubernetes API server so that the pod is
+	// reachable from the host even when the cluster network (svc.cluster.local,
+	// NodePort) is not directly accessible (e.g. Docker-driver minikube on macOS).
+	// Otherwise use cluster-internal DNS (in-cluster production deployment).
 	var target string
-	if pod.NodePort != nil {
-		// Use NodePort for external access
-		target = fmt.Sprintf("http://localhost:%d", *pod.NodePort)
+	if os.Getenv("K8S_NODE_IP") != "" && h.portForwardMgr != nil {
+		localPort, pfErr := h.portForwardMgr.LocalPort(pod.Namespace, pod.PodName, 8080)
+		if pfErr != nil {
+			h.logger.Error("Port-forward failed", zap.String("pulse_id", pulseID), zap.Error(pfErr))
+			http.Error(w, "Service unavailable", http.StatusBadGateway)
+			return
+		}
+		target = fmt.Sprintf("http://127.0.0.1:%d", localPort)
 	} else {
-		// Use cluster-internal service
 		target = fmt.Sprintf("http://%s.%s.svc.cluster.local:8080", pod.ServiceName, pod.Namespace)
 	}
 
@@ -73,6 +88,14 @@ func (h *ProxyHandler) ProxyToPod(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
+
+	h.logger.Info("Proxying request to pod",
+		zap.String("pulse_id", pulseID),
+		zap.String("method", r.Method),
+		zap.String("incoming_path", r.URL.Path),
+		zap.String("target", target),
+		zap.String("upgrade", r.Header.Get("Upgrade")),
+	)
 
 	// Create reverse proxy
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
@@ -85,17 +108,33 @@ func (h *ProxyHandler) ProxyToPod(w http.ResponseWriter, r *http.Request) {
 		req.URL.Host = targetURL.Host
 		req.URL.Scheme = targetURL.Scheme
 
+		// Strip the Origin header so code-server's built-in origin check doesn't
+		// reject the request. The browser sends the Aziron UI origin which
+		// differs from the pod's cluster-internal host, causing "Origin not allowed".
+		req.Header.Del("Origin")
+
 		// Rewrite path: /pulse/{pulse_id}/foo -> /foo
 		prefix := fmt.Sprintf("/pulse/%s", pulseID)
-		req.URL.Path = strings.TrimPrefix(r.URL.Path, prefix)
-		if req.URL.Path == "" {
-			req.URL.Path = "/"
+		rewritten := strings.TrimPrefix(r.URL.Path, prefix)
+		if rewritten == "" {
+			rewritten = "/"
 		}
+		h.logger.Debug("Proxy path rewrite",
+			zap.String("pulse_id", pulseID),
+			zap.String("original", r.URL.Path),
+			zap.String("rewritten", rewritten),
+		)
+		req.URL.Path = rewritten
 	}
 
 	// Error handler
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		h.logger.Error("Proxy error", zap.Error(err), zap.String("pulse_id", pulseID))
+		h.logger.Error("Proxy error",
+			zap.Error(err),
+			zap.String("pulse_id", pulseID),
+			zap.String("path", r.URL.Path),
+			zap.String("target", target),
+		)
 		http.Error(w, "Service unavailable", http.StatusBadGateway)
 	}
 

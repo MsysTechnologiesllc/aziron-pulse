@@ -37,15 +37,19 @@ func NewPodManager(client *Client) *PodManager {
 
 // PodConfig holds configuration for creating a pod
 type PodConfig struct {
-	Name          string
-	Namespace     string
-	Image         string
-	PVCName       string
-	WorkspacePath string
-	CPULimit      float64
-	MemoryLimitMB int
-	Labels        map[string]string
-	Env           map[string]string
+	Name              string
+	Namespace         string
+	Image             string
+	PVCName           string
+	WorkspacePath     string
+	CPULimit          float64
+	MemoryLimitMB     int
+	Labels            map[string]string
+	Env               map[string]string
+	FusionXBackendURL string // URL for FusionX extension to connect to Aziron
+	RepoURL           string // Git repository URL to clone into workspace
+	GitToken          string // OAuth token for private repo access
+	PulseID           string // Used by startup.sh to set code-server --base-path
 }
 
 // CreatePod creates a new pod with code-server
@@ -82,7 +86,7 @@ func (m *PodManager) CreatePod(ctx context.Context, config PodConfig) (*corev1.P
 	if jwtToken, ok := config.Env["JWT_TOKEN"]; ok && jwtToken != "" {
 		password = jwtToken
 	}
-	
+
 	envVars := []corev1.EnvVar{
 		{Name: "PASSWORD", Value: password},
 		{Name: "SUDO_PASSWORD", Value: "aziron"}, // Keep sudo password as default
@@ -93,6 +97,23 @@ func (m *PodManager) CreatePod(ctx context.Context, config PodConfig) (*corev1.P
 			continue
 		}
 		envVars = append(envVars, corev1.EnvVar{Name: key, Value: value})
+	}
+
+	// Inject FusionX connection URL
+	if config.FusionXBackendURL != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: "FUSIONX_BACKEND_URL", Value: config.FusionXBackendURL})
+	}
+	// Inject repo clone URL
+	if config.RepoURL != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: "REPO_URL", Value: config.RepoURL})
+	}
+	// Inject git token for private repos (stored in memory only — not persisted)
+	if config.GitToken != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: "GIT_ASKPASS_TOKEN", Value: config.GitToken})
+	}
+	// Inject pulse ID so startup.sh can set --base-path for code-server
+	if config.PulseID != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: "PULSE_ID", Value: config.PulseID})
 	}
 
 	pod := &corev1.Pod{
@@ -109,8 +130,9 @@ func (m *PodManager) CreatePod(ctx context.Context, config PodConfig) (*corev1.P
 			},
 			Containers: []corev1.Container{
 				{
-					Name:  "code-server",
-					Image: config.Image,
+					Name:            "code-server",
+					Image:           config.Image,
+					ImagePullPolicy: corev1.PullNever, // image must be pre-loaded into minikube via 'minikube image load'
 					Ports: []corev1.ContainerPort{
 						{
 							Name:          "http",
